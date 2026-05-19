@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config.settings import get_settings
 from src.database.connection import init_db, close_db
 from src.api.routes.auth import router as auth_router
+from src.api.routes.workflow import router as workflow_router
+from src.api.routes.intent import router as intent_router
 
 
 @asynccontextmanager
@@ -50,6 +52,8 @@ def create_app() -> FastAPI:
 
     # 注册路由
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(workflow_router, prefix="/api/v1")
+    app.include_router(intent_router, prefix="/api/v1")
 
     # 健康检查
     @app.get("/health")
