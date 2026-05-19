@@ -1,4 +1,7 @@
 services:
+  # ============================================
+  # Database Services
+  # ============================================
   mysql:
     image: mysql:8.0
     container_name: mysql-zhiliu
@@ -16,6 +19,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - zhiliu-network
 
   redis:
     image: redis:7-alpine
@@ -29,6 +34,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - zhiliu-network
 
   neo4j:
     image: neo4j:5-community
@@ -47,6 +54,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - zhiliu-network
 
   milvus:
     image: milvusdb/milvus:latest
@@ -65,7 +74,75 @@ services:
       start_period: 90s
       timeout: 20s
       retries: 3
+    networks:
+      - zhiliu-network
 
+  # ============================================
+  # Application Services
+  # ============================================
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: backend-zhiliu
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=123456
+      - MYSQL_DATABASE=zhiliu
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=12345678
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - zhiliu-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend-zhiliu
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - zhiliu-network
+
+  # ============================================
+  # Nginx Reverse Proxy (Optional)
+  # ============================================
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-zhiliu
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - zhiliu-network
+    profiles:
+      - production
+
+# ============================================
+# Volumes
+# ============================================
 volumes:
   mysql_data:
     driver: local
@@ -77,3 +154,10 @@ volumes:
     driver: local
   milvus_data:
     driver: local
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  zhiliu-network:
+    driver: bridge
