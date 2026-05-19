@@ -13,6 +13,7 @@ from src.database.connection import init_db, close_db
 from src.api.routes.auth import router as auth_router
 from src.api.routes.workflow import router as workflow_router
 from src.api.routes.intent import router as intent_router
+from src.api.routes.analytics import router as analytics_router
 
 
 @asynccontextmanager
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(workflow_router, prefix="/api/v1")
     app.include_router(intent_router, prefix="/api/v1")
+    app.include_router(analytics_router, prefix="/api/v1")
 
     # 健康检查
     @app.get("/health")
