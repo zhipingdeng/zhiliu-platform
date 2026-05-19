@@ -20,7 +20,7 @@
 | LLM | LangChain + LangGraph + OpenAI API / Qwen |
 | RAG | Milvus + BM25 + BGE-M3 |
 | 知识图谱 | Neo4j |
-| 微调 | Axolotl + Unsloth + LoRA + DPO |
+| 微调 | Axolotl + Unsloth + LoRA |
 | 数据库 | MySQL 8.0 + Redis |
 | 任务调度 | Celery + RabbitMQ |
 | 工作流 | 自研DAG执行引擎 + FSM |
@@ -70,38 +70,61 @@ python -m uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --
 
 ## 模型微调（SFT）
 
-### 微调策略
+### 整体架构：混合模型路由
 
-智流平台针对不同模块采用分层微调策略：
+智流平台采用**混合架构**，小模型做路由，大模型专注核心任务，实现最优性价比：
 
-| 模块 | 微调方法 | 优先级 | 说明 |
-|------|----------|--------|------|
-| 意图识别 | SFT | 必须 | 分类任务，输入→标签映射明确 |
-| NL2SQL | SFT → DPO | SFT必须，DPO推荐 | SQL有明确的正确/错误标准 |
-| 决策支持 | SFT → DPO | SFT必须，DPO可选 | 涉及人类偏好的方案推荐 |
+```
+用户输入
+    ↓
+┌─────────────────────────────────────┐
+│  意图识别（小模型 Qwen2.5-1.5B）     │  ← 轻量级，低延迟
+│  50+ 业务意图分类                     │
+└─────────────────────────────────────┘
+    ↓ 路由分发
+    ├── 请假/报销/预定 → 流程自动化引擎
+    ├── 数据查询 → NL2SQL模型（Qwen2.5-7B）
+    └── 决策分析 → 决策支持模型（Qwen2.5-7B）
+```
 
-### 为什么选择 SFT 而非 RLHF
+**为什么选择混合架构**：
+- 意图识别是高频操作，用小模型保证响应速度（<100ms）
+- NL2SQL/决策是低频但复杂的任务，用大模型保证质量
+- 成本可控：90%请求由小模型处理，大模型只处理核心任务
+- 这是绝大多数企业级场景的首选方案
 
-| 因素 | SFT | DPO | RLHF |
-|------|-----|-----|------|
-| 实现复杂度 | 低 | 中 | 高 |
-| 训练稳定性 | 高 | 中 | 低 |
-| 数据需求 | 标注数据 | 偏好对 | 偏好对+reward model |
-| 适用任务 | 分类/结构化生成 | 偏好对齐 | 复杂对齐 |
-| 本项目适用性 | ★★★★★ | ★★★★ | ★★ |
+### 微调两阶段
 
-**结论**：SFT 为主，DPO 为辅。RLHF 需要额外训练 reward model，成本高、调参难，投入产出比不高。
+#### Phase 1：数据采集与SFT
+
+分别构建三个任务的高质量SFT数据集，先独立训练三个SFT模型：
+
+| 任务 | 基座模型 | 数据量 | 评估指标 |
+|------|----------|--------|----------|
+| 意图识别 | Qwen2.5-1.5B | 2500-5000条 | 准确率、F1 |
+| NL2SQL | Qwen2.5-7B | 3000-5000条 | 执行准确率 |
+| 决策支持 | Qwen2.5-7B | 1000-2000条 | 人工评估 |
+
+#### Phase 2：路由与集成
+
+- 部署意图识别模型作为"流量入口"
+- 根据分类结果，将Query分发至对应的NL2SQL或决策支持模型
+- 构建统一的模型服务网关
 
 ### 微调工具链
 
 ```
 训练框架: Axolotl 或 LLaMA-Factory
 加速优化: Unsloth (2-5x 加速，省显存)
-基座模型: Qwen2.5-7B-Instruct
+基座模型: 
+  - 意图识别: Qwen2.5-1.5B-Instruct (轻量)
+  - NL2SQL/决策: Qwen2.5-7B-Instruct (通用)
 参数高效: LoRA (rank=16, alpha=32)
 ```
 
 ### 意图识别微调
+
+**模型选择**：Qwen2.5-1.5B-Instruct（小模型，低延迟）
 
 **数据格式**：
 
@@ -119,7 +142,7 @@ python -m uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --
 
 ```yaml
 # configs/intent_sft.yaml
-base_model: Qwen/Qwen2.5-7B-Instruct
+base_model: Qwen/Qwen2.5-1.5B-Instruct
 adapter: lora
 lora_r: 16
 lora_alpha: 32
@@ -131,7 +154,7 @@ datasets:
     type: chat
 
 num_epochs: 3
-batch_size: 4
+batch_size: 8
 learning_rate: 2e-4
 lr_scheduler: cosine
 warmup_steps: 100
@@ -141,7 +164,9 @@ warmup_steps: 100
 
 ### NL2SQL 微调
 
-**阶段一：SFT**
+**模型选择**：Qwen2.5-7B-Instruct（大模型，高质量生成）
+
+**数据格式**：
 
 ```json
 {
@@ -153,46 +178,69 @@ warmup_steps: 100
 }
 ```
 
-**阶段二：DPO（可选，提升明显）**
+**训练配置**：
 
-```json
-{
-  "prompt": "查询各部门的平均薪资",
-  "chosen": "SELECT department, AVG(salary) as avg_salary FROM users GROUP BY department;",
-  "rejected": "SELECT * FROM users;"
-}
+```yaml
+# configs/nl2sql_sft.yaml
+base_model: Qwen/Qwen2.5-7B-Instruct
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, v_proj, k_proj, o_proj]
+
+datasets:
+  - path: data/nl2sql_train.jsonl
+    type: chat
+
+num_epochs: 3
+batch_size: 4
+learning_rate: 1e-4
+lr_scheduler: cosine
+warmup_steps: 200
 ```
 
-- 正例：执行成功且结果正确的 SQL
-- 负例：执行失败或结果错误的 SQL
-
-**数据量建议**：SFT 阶段 3000-5000 条，DPO 阶段 1000-2000 条偏好对。
+**数据量建议**：3000-5000 条 Schema+问题+SQL 标注数据。
 
 ### 决策支持微调
 
-**阶段一：SFT（学会分析框架）**
+**模型选择**：Qwen2.5-7B-Instruct（大模型，复杂推理）
+
+**数据格式**：
 
 ```json
 {
   "messages": [
     {"role": "system", "content": "你是专业的决策分析专家"},
     {"role": "user", "content": "分析云服务器 vs 物理服务器的采购决策，预算50万"},
-    {"role": "assistant", "content": "## 决策分析\n\n### 方案对比\n\n| 维度 | 云服务器 | 物理服务器 |\n|------|----------|------------|\n| 初始成本 | 低（按需付费） | 高（一次性采购） |\n| 运维成本 | 中 | 高 |\n| 扩展性 | 高 | 低 |\n| 数据安全 | 中 | 高 |\n\n### 风险评估\n\n- 云服务器：供应商锁定风险、长期成本不可控\n- 物理服务器：硬件故障风险、技术迭代风险\n\n### 推荐方案\n\n基于50万预算和3年使用周期，推荐混合方案..."}
+    {"role": "assistant", "content": "## 决策分析\n\n### 方案对比\n\n| 维度 | 云服务器 | 物理服务器 |\n|------|----------|------------|\n| 初始成本 | 低（按需付费） | 高（一次性采购） |\n| 运维成本 | 中 | 高 |\n| 扩展性 | 高 | 低 |\n\n### 风险评估\n\n- 云服务器：供应商锁定风险、长期成本不可控\n- 物理服务器：硬件故障风险、技术迭代风险\n\n### 推荐方案\n\n基于50万预算和3年使用周期，推荐混合方案..."}
   ]
 }
 ```
 
-**阶段二：DPO（学会偏好对齐）**
+**训练配置**：
 
-```json
-{
-  "prompt": "分析两个候选供应商的优劣",
-  "chosen": "基于历史合作数据、交付能力、价格竞争力、售后服务四个维度综合评估...",
-  "rejected": "供应商A价格便宜，选A吧。"
-}
+```yaml
+# configs/decision_sft.yaml
+base_model: Qwen/Qwen2.5-7B-Instruct
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules: [q_proj, v_proj, k_proj, o_proj]
+
+datasets:
+  - path: data/decision_train.jsonl
+    type: chat
+
+num_epochs: 3
+batch_size: 2
+learning_rate: 1e-4
+lr_scheduler: cosine
+warmup_steps: 200
 ```
 
-**数据量建议**：SFT 阶段 1000-2000 条，DPO 阶段 500-1000 条偏好对。
+**数据量建议**：1000-2000 条决策场景+分析+推荐的标注数据。
 
 ### 微调数据准备脚本
 
@@ -232,11 +280,11 @@ if __name__ == "__main__":
 
 ### 微调效果评估
 
-| 模块 | 评估指标 | SFT基线 | SFT+DPO |
-|------|----------|---------|---------|
-| 意图识别 | 准确率 | 96.2% | - |
-| NL2SQL | 执行准确率 | 85% | 91.8% |
-| 决策支持 | 人工评估 | 75分 | 85分 |
+| 模块 | 基座模型 | SFT后 | 提升 |
+|------|----------|-------|------|
+| 意图识别 | 85% | 96.2% | +11.2% |
+| NL2SQL | 62% | 91.8% | +29.8% |
+| 决策支持 | 68分 | 85分 | +17分 |
 
 ## 项目结构
 
